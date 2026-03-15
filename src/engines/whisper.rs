@@ -235,6 +235,12 @@ impl TranscriptionEngine for WhisperEngine {
         samples: Vec<f32>,
         params: Option<Self::InferenceParams>,
     ) -> Result<TranscriptionResult, Box<dyn std::error::Error>> {
+        use std::time::Instant;
+        let profile_total = Instant::now();
+
+        let audio_duration_secs = samples.len() as f32 / 16000.0;
+        eprintln!("[PROFILE] Audio samples:        {} ({:.1}s @ 16kHz)", samples.len(), audio_duration_secs);
+
         let state = self
             .state
             .as_mut()
@@ -242,6 +248,7 @@ impl TranscriptionEngine for WhisperEngine {
 
         let whisper_params = params.unwrap_or_default();
 
+        let t_params = Instant::now();
         let mut full_params = FullParams::new(SamplingStrategy::BeamSearch {
             beam_size: 3,
             patience: -1.0,
@@ -259,9 +266,16 @@ impl TranscriptionEngine for WhisperEngine {
         if let Some(ref prompt) = whisper_params.initial_prompt {
             full_params.set_initial_prompt(prompt);
         }
+        let params_elapsed = t_params.elapsed();
 
+        // state.full() is the main FFI call into whisper.cpp — it performs:
+        //   mel spectrogram → encoder forward pass → beam search decoding
+        // all in one opaque call. We can't break it apart from Rust.
+        let t_inference = Instant::now();
         state.full(full_params, &samples)?;
+        let inference_elapsed = t_inference.elapsed();
 
+        let t_segments = Instant::now();
         let num_segments = state
             .full_n_segments()
             .expect("failed to get number of segments");
@@ -281,6 +295,13 @@ impl TranscriptionEngine for WhisperEngine {
             });
             full_text.push_str(&text);
         }
+        let segments_elapsed = t_segments.elapsed();
+
+        let total_elapsed = profile_total.elapsed();
+        eprintln!("[PROFILE] Param setup:          {:.3}s", params_elapsed.as_secs_f64());
+        eprintln!("[PROFILE] whisper.cpp full():   {:.3}s  (mel + encode + decode)", inference_elapsed.as_secs_f64());
+        eprintln!("[PROFILE] Segment extraction:   {:.3}s  ({} segments)", segments_elapsed.as_secs_f64(), num_segments);
+        eprintln!("[PROFILE] Engine total:         {:.3}s", total_elapsed.as_secs_f64());
 
         Ok(TranscriptionResult {
             text: full_text.trim().to_string(),
